@@ -16,19 +16,20 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    TrainingArguments,
     pipeline,
     logging,
 )
 from langchain import HuggingFacePipeline
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
+from langchain.chains import ConversationalRetrievalChain, LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
 from peft import LoraConfig, PeftModel
 import pdb
 from sentence_transformers import SentenceTransformer
 import logging
-from rouge import Rouge
+#from rouge import Rouge
 
 
 def define_argparser():
@@ -37,7 +38,7 @@ def define_argparser():
     parser.add_argument('--num_gpu', type=str, default="auto", 
                         help="Support '0', '1', 'auto'.")
     parser.add_argument('--dir_data', type=str, default="../data/")
-    parser.add_argument('--rag_data', type=str, default="keyword_no_question_with_longest_answer.csv")
+    parser.add_argument('--rag_data', type=str, nargs='+', default=None)
     parser.add_argument('--model_path', type=str, default="../model/orion_1/final/" ) 
     parser.add_argument('--max_length', type=int, default=5000)
     parser.add_argument('--dir_save', type=str, default="./output_rag/")
@@ -45,7 +46,7 @@ def define_argparser():
     parser.add_argument('--test_sample_data', type=str, default="test_sample.csv") 
     parser.add_argument('--emb_model', type=str, default="BAAI/bge-m3")
     parser.add_argument('--top_k', type=int, default=3)
-    parser.add_argument('--add_fn', type=str, default="exp")
+    parser.add_argument('--add_fn', type=str, default="newdoc")
 
     parser.add_argument('--temp', type=float, default=0.1)
     parser.add_argument('--top_p', type=float, default=0.1)
@@ -67,10 +68,13 @@ def define_logger():
     return logger
 
 def load_document(dir_data, rag_data):
-    #loader = CSVLoader(file_path = os.path.join(dir_data, rag_data))
-    loader = CSVLoader(os.path.join(dir_data, rag_data), 'contents', ['idx'])
+    if "blog" in rag_data:
+        loader = CSVLoader(os.path.join(dir_data, rag_data))
+    else:
+        loader = CSVLoader(os.path.join(dir_data, rag_data), 'contents', ['idx'])
+    
     documents = loader.load()
-    documents = [i.page_content for i in documents]
+    #documents = [i.page_content for i in documents]
 
     return documents
 
@@ -96,10 +100,9 @@ def load_model_and_tokenizer(model_path):
     return model, tokenizer
 
 def rag_answer(chain, query) :
-    #prompt = f"<s>[INST] Please answer in Korean. {query} [/INST]"
-    prompt = f"[INST] 한국어로 답변해주세요. {query} [/INST]"
+    #prompt = f"<s>[INST] 참고한 문서의 내용을 모두 포함해서 세 문장 이상으로 답변해줘. {query} [/INST]"
     chat_history = []
-    result = chain({"question": prompt, "chat_history": chat_history})
+    result = chain({"question": query, "chat_history": chat_history})
 
     return result['answer'], result["source_documents"]
 
@@ -127,19 +130,26 @@ def cal_cos_rouge(df_test):
     for gpt, pred in zip(gpt_embeddings, pred_embeddings):
         result.append(cosine_similarity(gpt, pred))
 
-    rouge = Rouge()
-    r_score = rouge.get_scores(df_test['RAG답변'], df_test['GPT 답변'], avg=True)
-
-    return result, r_score
+    #rouge = Rouge()
+    #r_score = rouge.get_scores(df_test['RAG답변'], df_test['GPT 답변'], avg=True)
+    
+    return result, 0
 
 
 def rag(args):
+    
     start_time = time.time()
     logger = define_logger()
     logger.info("")
     logger.info("Start")
 
-    documents = load_document(args.dir_data, args.rag_data)
+    documents = None
+    for rag_data in args.rag_data:
+        if documents:
+            new_doc = load_document(args.dir_data, rag_data)
+            documents += new_doc
+        else:
+            documents = load_document(args.dir_data, rag_data)
     model, tokenizer = load_model_and_tokenizer(args.model_path)
     logger.info(f"model : {model.config._name_or_path}")
     logger.info(f"model_path : {args.model_path}")
@@ -148,15 +158,17 @@ def rag(args):
     pipe = pipeline(task="text-generation",
                 model=model,
                 tokenizer=tokenizer,
-                max_length=args.max_length,
+                max_length=args.max_length, 
                 device_map="auto",
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
                )
     
     llm = HuggingFacePipeline(
         pipeline=pipe,
-        #model_kwargs={'max_length':5000}
-        model_kwargs={'temperature':args.temp, 'top_p':args.top_p}
+        model_kwargs={'temperature':args.temp, 
+                      'top_p':args.top_p, 
+                      'max_length':args.max_length
+                      }
     )
         
     query_lst = pd.read_csv(os.path.join(args.dir_data, args.test_data))
@@ -164,21 +176,42 @@ def rag(args):
 
     embeddings = HuggingFaceEmbeddings(
         model_name=args.emb_model,
-        model_kwargs={'device':'cuda'},
+        model_kwargs={'device':'cpu'},
         encode_kwargs={'normalize_embeddings':False}
     )
 
-    vectordb = FAISS.from_texts(
-        documents,
+    vectordb = FAISS.from_documents(
+        documents = documents,
         embedding = embeddings,
     )
 
-    retriever = vectordb.as_retriever(search_kwargs={"k":args.top_k}) # 상위 top_k개의 결과를 반환
+    # 다중질문 처리하는 prompt template
+    QUERY_PROMPT = PromptTemplate(
+        input_variables=['question'],
+        template = """
+            Your task is to split multiple querys to single query that aim to answer all user's questions 
+            The user questions are focused on interior, papering, and related techniques.
+            Each query Must tackle the question from a different viewpoint, we want to get a variety of RELEVANT search results.
+            Provide these alternative questions seperated by newlines.
+            Original question : {question}
+        """
+    )
 
+    retriever = vectordb.as_retriever(search_type="mmr",
+                                      search_kwargs={"k":args.top_k, "fetch_k":args.top_k}) # 상위 top_k개의 결과를 반환
+
+
+    retriever_from_llm = MultiQueryRetriever.from_llm(
+        retriever = retriever,
+        llm = llm,
+        prompt = QUERY_PROMPT,
+    )
+        
     # Chaining a pipeline
     chain = ConversationalRetrievalChain.from_llm(
-        llm,
-        retriever,
+        llm=llm,
+        retriever=retriever_from_llm,
+        max_tokens_limit = 4096,
         return_source_documents=True
     )
 
@@ -186,8 +219,13 @@ def rag(args):
     answers_doc = []
     for q in tqdm(query_lst) :
         a, doc = rag_answer(chain, q)
+        try:
+            doc = [d.page_content for d in doc] # metadata 제외하여 contents만 추출
+        except:
+            pdb.set_trace()
         answers_rag.append(a)
         answers_doc.append(doc)
+        #time.sleep(2)
 
     if not os.path.isdir(args.dir_save):
         os.mkdir(args.dir_save)
@@ -222,8 +260,7 @@ def rag(args):
     logger.info(f"=== 파일 생성 : {fn}_submission({n}).csv")
 
     logger.info(f"=== cos(33개) : {sum(cos_33)/33}")
-    logger.info(f"=== rouge-l : {rouge_33['rouge-l']}")
-    pdb.set_trace()
+    logger.info(f"=== rouge-l : {rouge_33}")
     logger.info(f"=== 빈 sting 개수 : {len(df[df.RAG답변.apply(lambda x:len(x.strip()))==0])}")
 
     end_time = time.time()
